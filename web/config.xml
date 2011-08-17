@@ -1,0 +1,20 @@
+<?xml version='1.0' standalone='yes'?>
+<iplogd>
+	<db>
+		<user>root</user>
+		<pass></pass>
+		<host>localhost</host>
+		<name>iplog</name>
+		<port>3306</port>
+		<debug></debug>
+	</db>
+	<path>
+		<root>/var/www/IPLog/web</root>
+		<smarty>
+			<template>/smarty/templates</template>
+			<compile>/smarty/templates_c</compile>
+			<cache>/smarty/cache</cache>
+			<config>/smarty/configs</config>
+		</smarty>
+	</path>
+</iplogd>

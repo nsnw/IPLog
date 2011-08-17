@@ -1,0 +1,10 @@
+<iplogd>
+	<db>
+		<user>root</user>
+		<pass></pass>
+		<host>localhost</host>
+		<database>iplog</database>
+		<port>3306</port>
+	</db>
+	<debug>0</debug>
+</iplogd>

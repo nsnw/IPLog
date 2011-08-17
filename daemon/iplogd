@@ -1,0 +1,387 @@
+#!/usr/bin/perl
+
+#=======================================================================
+# iplogd
+# $Id: iplogd 4 2009-12-21 00:57:38Z andys $
+# $HeadURL: http://daedalus.dn7.ncnet.nocarrier.org.uk/svn/IPLog/daemon/iplogd $
+# (c)2009 Andy Smith <andy.smith@netprojects.org.uk>
+#-----------------------------------------------------------------------
+#:Description
+# This is the proessing daemon for IPLog.
+#-----------------------------------------------------------------------
+#=======================================================================
+
+# Use strict/warnings
+use strict;
+use warnings;
+# Use IPTables::Log for log processing
+use IPTables::Log;
+# Use DBI for database connectivity
+use DBI;
+# Use XML::Simple for parsing the configuration file
+use XML::Simple;
+# Use Getopt::Std for parsing command-line arguments
+use Getopt::Std;
+# DEBUG: Use Data::Dumper for debugging
+use Data::Dumper;
+# Use POSIX time stuff
+use POSIX qw(strftime);
+
+# Set version string
+my $VERSION = "0.01";
+
+# Define some constants
+use constant {
+	CRIT	=> 0,
+	ERR		=> 1,
+	WARN	=> 2,
+	NOTICE	=> 3,
+	INFO	=> 4,
+	DEBUG	=> 5,
+};
+
+# Get options
+# -c <file>				Path to config file. Default is ./iplogd.conf.xml
+my %opts;
+getopts('dc:', \%opts);
+
+my $config;
+$opts{'c'} ? $config = XMLin($opts{'c'}) : $config = XMLin("./iplogd.conf.xml");
+
+# Some functions
+sub log
+{
+	my ($pri, $msg) = @_;
+
+	my $timestamp = strftime "%a %b %e %H:%M:%S %Y", gmtime;
+	if(($pri le 2) || ($config->{'debug'} eq 1))
+	{
+		print STDERR "[".$timestamp."]\t".$msg."\n";
+	}
+}
+
+&log(WARN, "iplogd ".$VERSION." started.");
+
+# Start connection to database
+my $dsn = "DBI:mysql:database=".$config->{'db'}{'database'}.";host=".$config->{'db'}{'host'}.";port=".$config->{'db'}{'port'};
+&log(DEBUG, "DSN is '".$dsn."', user is '".$config->{'db'}{'user'}."'");
+my $dbh = DBI->connect($dsn, $config->{'db'}{'user'}, $config->{'db'}{'pass'});
+
+if (not $dbh)
+{
+	&log(CRIT, "Cannot connect to database!");
+	exit;
+}
+else
+{
+	&log(INFO, "Connected successfully to database.");
+}
+
+if($opts{'d'})
+{
+	my @tables = qw/chain group host ip port source interface log/;
+
+	foreach my $table (@tables)
+	{
+		&log(WARN, "Clearing table '".$table."'...");
+		$dbh->do("TRUNCATE TABLE `".$table."`");
+	}
+
+	$dbh->do("UPDATE raw SET processed = 0, parsed = 0");
+}
+
+# Set up some prepared statements
+my %sql = ( 
+	'all_raw' 				=> $dbh->prepare("SELECT * FROM raw WHERE processed = 0"),
+	# Source queries
+	'check_source_exists'	=> $dbh->prepare("SELECT * FROM source WHERE ip = ?"),
+	'add_source'			=> $dbh->prepare("INSERT INTO source (ip) VALUES (?)"),
+	# Chain queries
+	'check_chain_exists'	=> $dbh->prepare("SELECT id FROM chain WHERE source_id = ? AND name = ?"),
+	'add_chain'				=> $dbh->prepare("INSERT INTO chain (source_id, name) VALUES (?, ?)"),
+	# Host queries
+	'check_host_exists'		=> $dbh->prepare("SELECT * FROM host WHERE hostname = ?"),
+	'add_host'				=> $dbh->prepare("INSERT INTO host (hostname, friendlyname) VALUES (?, ?)"),
+	# IP queries
+	'check_ip_exists'		=> $dbh->prepare("SELECT * FROM ip WHERE addr = ?"),
+	'get_ip_host'			=> $dbh->prepare("SELECT host_id FROM ip WHERE addr = ?"),
+	'get_ip_id'				=> $dbh->prepare("SELECT id FROM ip WHERE addr = ?"),
+	'add_ip'				=> $dbh->prepare("INSERT INTO ip (addr) VALUES (?)"),
+	# Port queries
+	'check_port_exists'		=> $dbh->prepare("SELECT id FROM port WHERE protocol = ? AND port = ?"),
+	'add_port'				=> $dbh->prepare("INSERT INTO port (protocol, port) VALUES (?, ?)"),
+	'check_port_exists_e'	=> $dbh->prepare("SELECT id FROM port WHERE protocol = ? AND port = ? AND extra = ?"),
+	'add_port_e'			=> $dbh->prepare("INSERT INTO port (protocol, port, extra) VALUES (?, ?, ?)"),
+	# Proto queries
+	'check_proto_exists'	=> $dbh->prepare("SELECT id FROM port WHERE protocol = ? AND port IS NULL"),
+	'add_proto'				=> $dbh->prepare("INSERT INTO port (protocol) VALUES (?)"),
+	# Interface queries
+	'check_iface_exists'	=> $dbh->prepare("SELECT id FROM interface WHERE name = ? AND source_id = ?"),
+	'add_iface'				=> $dbh->prepare("INSERT INTO interface (name, source_id) VALUES (?, ?)"),
+	# Log queries
+	'add_log'				=> $dbh->prepare("INSERT INTO log (timestamp, source_id, i_iface_id, o_iface_id, chain_id, src_id, dst_id, spt_id, dpt_id, original) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+	'proc_raw'				=> $dbh->prepare("UPDATE raw SET processed = 1 WHERE id = ?"),
+	'parsed_raw'			=> $dbh->prepare("UPDATE raw SET parsed = 1 WHERE id = ?"),
+);
+
+&log(DEBUG, "Prepared SQL queries.");
+
+# Get all raw records that haven't been processed
+my $sth = $sql{'all_raw'};
+$sth->execute;
+my $c_records = $sth->rows;
+
+&log(WARN, "Found ".$c_records." records.");
+
+while ( my $row = $sth->fetchrow_hashref ) {
+	my $record = IPTables::Log::Set::Record->create({'text' => $row->{'msg'}, 'no_header' => 1});
+	$record->parse;
+
+	if($record->get_parsed)
+	{
+		my ($source_id, $i_iface_id, $o_iface_id, $chain_id, $src_id, $dst_id, $spt_id, $dpt_id, $type_id, $proto_id);
+
+		# Process source
+		my $source_sth = $sql{'check_source_exists'};
+		$source_sth->execute($row->{'host'});
+		if($source_sth->rows)
+		{
+			my $id = $source_sth->fetchrow_hashref;
+			&log(DEBUG, "SOURCE: Source entry found for '".$row->{'host'}."' (#".$id->{'id'}.")");
+			$source_id = $id->{'id'};
+		}
+		else
+		{
+			my $source_add_sth = $sql{'add_source'};
+			$source_add_sth->execute($row->{'host'});
+			my $id = $dbh->last_insert_id(undef, undef, undef, undef);
+			&log(DEBUG, "SOURCE: Source entry created for '".$row->{'host'}."' (#".$id.")");
+			$source_id = $id;
+		}
+
+		# Process ingress interface
+		my $i_iface_sth = $sql{'check_iface_exists'};
+		$i_iface_sth->execute($record->get_in, $source_id);
+		if($i_iface_sth->rows)
+		{
+			my $id = $i_iface_sth->fetchrow_hashref;
+			&log(DEBUG, "IFACE (IN): Interface entry found for '".$record->get_in."' (on ".$row->{'host'}.") (#".$id->{'id'}.")");
+			$i_iface_id = $id->{'id'};
+		}
+		else
+		{
+			my $iface_add_sth = $sql{'add_iface'};
+			$iface_add_sth->execute($record->get_in, $source_id);
+			my $id = $dbh->last_insert_id(undef, undef, undef, undef);
+			&log(DEBUG, "SOURCE: Source entry created for '".$row->{'host'}."' (on ".$row->{'host'}.") (#".$id.")");
+			$i_iface_id = $id;
+		}
+	
+		# Process egress interface
+		my $o_iface_sth = $sql{'check_iface_exists'};
+		$o_iface_sth->execute($record->get_out, $source_id);
+		if($o_iface_sth->rows)
+		{
+			my $id = $o_iface_sth->fetchrow_hashref;
+			&log(DEBUG, "IFACE (OUT): Interface entry found for '".$record->get_out."' (on ".$row->{'host'}.") (#".$id->{'id'}.")");
+			$o_iface_id = $id->{'id'};
+		}
+		else
+		{
+			my $iface_add_sth = $sql{'add_iface'};
+			$iface_add_sth->execute($record->get_out, $source_id);
+			my $id = $dbh->last_insert_id(undef, undef, undef, undef);
+			&log(DEBUG, "SOURCE: Source entry created for '".$row->{'host'}."' (on ".$row->{'host'}.") (#".$id.")");
+			$o_iface_id = $id;
+		}
+	
+		# Process chain name
+		if($record->get_prefix)
+		{
+			my $chain_sth = $sql{'check_chain_exists'};
+			$chain_sth->execute($source_id, $record->get_prefix);
+			if($chain_sth->rows)
+			{
+				my $id = $chain_sth->fetchrow_hashref;
+				&log(DEBUG, "CHAIN: Chain entry found for '".$record->get_prefix."' (for '".$row->{'host'}."') (#".$id->{'id'}.")");
+				$chain_id = $id->{'id'};
+			}
+			else
+			{
+				# Add the chains
+				my $chain_add_sth = $sql{'add_chain'};
+				$chain_add_sth->execute($source_id, $record->get_prefix);
+				my $id = $dbh->last_insert_id(undef, undef, undef, undef);
+				&log(DEBUG, "CHAIN: Chain entry created for '".$record->get_prefix."' (for '".$row->{'host'}."') (#".$id.")");
+				$chain_id = $id;
+			}
+		}
+
+		# Examine source and destination
+		# Check for source
+		if($record->get_src)
+		{
+			my $src_sth = $sql{'get_ip_id'};
+			$src_sth->execute($record->get_src);
+			if($src_sth->rows)
+			{
+				my $id = $src_sth->fetchrow_hashref;
+				&log(DEBUG, "SRC: IP entry found for '".$record->get_src."' (#".$id->{'id'}.")");
+				$src_id = $id->{'id'};
+			}
+			else
+			{
+				# Add the IP
+				my $src_add_sth = $sql{'add_ip'};
+				$src_add_sth->execute($record->get_src);
+				my $id = $dbh->last_insert_id(undef, undef, undef, undef);
+				&log(DEBUG, "SRC: IP entry created for '".$record->get_src."' (#".$id.")");
+				$src_id = $id;
+			}
+		}
+	
+		# Check for destination
+		if($record->get_dst)
+		{
+			my $dst_sth = $sql{'get_ip_id'};
+			$dst_sth->execute($record->get_dst);
+			if($dst_sth->rows)
+			{
+				my $id = $dst_sth->fetchrow_hashref;
+				&log(DEBUG, "DST: IP entry found for '".$record->get_dst."' (#".$id->{'id'}.")");
+				$dst_id = $id->{'id'};
+			}
+			else
+			{
+				# Add the IP
+				my $dst_add_sth = $sql{'add_ip'};
+				$dst_add_sth->execute($record->get_dst);
+				my $id = $dbh->last_insert_id(undef, undef, undef, undef);
+				&log(DEBUG, "DST: IP entry created for '".$record->get_dst."' (#".$id.")");
+				$dst_id = $id;
+			}
+		}	
+	
+		# Check for protocol
+		if($record->get_proto ne 'NONE')
+		{
+			if(($record->get_proto eq 'TCP') || ($record->get_proto eq 'UDP'))
+			{
+				&log(DEBUG, "Got protocol: ".$record->get_proto);
+				# Check for source port
+				if($record->get_spt)
+				{
+					my $spt_sth = $sql{'check_port_exists'};
+					$spt_sth->execute($record->get_proto, $record->get_spt);
+					if($spt_sth->rows)
+					{
+						my $id = $spt_sth->fetchrow_hashref;
+						&log(DEBUG, "SPT: Source port '".$record->get_spt."' (for protocol '".$record->get_proto."') found (#".$id->{'id'}.")");
+						$spt_id = $id->{'id'};
+					}
+					else
+					{
+						my $spt_add_sth = $sql{'add_port'};
+						$spt_add_sth->execute($record->get_proto, $record->get_spt);
+						$spt_id = $dbh->last_insert_id(undef, undef, undef, undef);
+						&log(DEBUG, "SPT: Source port '".$record->get_spt."' (for protocol '".$record->get_proto."') added (#".$spt_id.")");
+					}
+				}
+		
+				# Check for destination port
+				if($record->get_dpt)
+				{
+					my $dpt_sth = $sql{'check_port_exists'};
+					$dpt_sth->execute($record->get_proto, $record->get_dpt);
+					if($dpt_sth->rows)
+					{
+						my $id = $dpt_sth->fetchrow_hashref;
+						&log(DEBUG, "DPT: Destination port '".$record->get_dpt."' (for protocol '".$record->get_proto."') found (#".$id->{'id'}.")");
+						$dpt_id = $id->{'id'};
+					}
+					else
+					{
+						my $dpt_add_sth = $sql{'add_port'};
+						$dpt_add_sth->execute($record->get_proto, $record->get_dpt);
+						$dpt_id = $dbh->last_insert_id(undef, undef, undef, undef);
+						&log(DEBUG, "DPT: Destination port '".$record->get_dpt."' (for protocol '".$record->get_proto."') added (#".$spt_id.")");
+					}
+				}
+			}
+			elsif($record->get_proto eq "ICMP")
+			{
+				my $type_sth = $sql{'check_port_exists_e'};
+				$type_sth->execute($record->get_proto, $record->get_type, $record->get_code);
+				if($type_sth->rows)
+				{
+					my $id = $type_sth->fetchrow_hashref;
+					&log(DEBUG, "ICMP TYPE: Type '".$record->get_type."', code '".$record->get_code."' found (#".$id->{'id'}.")");
+					$type_id = $id->{'id'};
+				}
+				else
+				{
+					my $type_add_sth = $sql{'add_port_e'};
+					$type_add_sth->execute($record->get_proto, $record->get_type, $record->get_code);
+					$type_id = $dbh->last_insert_id(undef, undef, undef, undef);
+					&log(DEBUG, "ICMP TYPE: Type '".$record->get_type."', code '".$record->get_code."' added (#".$type_id.")");
+				}
+			}
+			elsif(($record->get_proto eq "2"))
+			{
+				my $proto_sth = $sql{'check_proto_exists'};
+				$proto_sth->execute($record->get_proto);
+				if($proto_sth->rows)
+				{
+					my $id = $proto_sth->fetchrow_hashref;
+					&log(DEBUG, "PROTO: Protocol '".$record->get_proto."' found (#".$id->{'id'}.")");
+					$proto_id = $id->{'id'};
+				}
+				else
+				{
+					my $proto_add_sth = $sql{'add_proto'};
+					$proto_add_sth->execute($record->get_proto);
+					$proto_id = $dbh->last_insert_id(undef, undef, undef, undef);
+					&log(DEBUG, "PROTO: Protocol '".$record->get_proto."' added (#".$proto_id.")");
+				}
+			}
+			else
+			{
+				&log(WARN, "Could not parse log message: ".$row->{'msg'});
+				exit;
+			}
+	
+		}
+
+		my $log_sth = $sql{'add_log'};
+		if($proto_id)
+		{
+			$log_sth->execute($row->{'timestamp'}, $source_id, $i_iface_id, $o_iface_id, $chain_id, $src_id, $dst_id, $proto_id, undef, $row->{'msg'});
+		}
+		elsif($type_id)
+		{
+			$log_sth->execute($row->{'timestamp'}, $source_id, $i_iface_id, $o_iface_id, $chain_id, $src_id, $dst_id, $type_id, undef, $row->{'msg'});
+		}
+		else
+		{
+			if(!$chain_id)
+			{
+				print Dumper($record);
+				exit;
+			}
+			$log_sth->execute($row->{'timestamp'}, $source_id, $i_iface_id, $o_iface_id, $chain_id, $src_id, $dst_id, $spt_id, $dpt_id, $row->{'msg'});
+		}
+		my $id = $dbh->last_insert_id(undef, undef, undef, undef);
+
+		&log(DEBUG, "LOG: Log message added (#".$id.")");
+		my $parsed_raw_sth = $sql{'parsed_raw'};
+		$parsed_raw_sth->execute($row->{'id'});
+	}
+	else
+	{
+		&log(DEBUG, "Skipped unparseable message...");
+	}
+	my $proc_raw_sth = $sql{'proc_raw'};
+	$proc_raw_sth->execute($row->{'id'});
+
+}	
+
